@@ -1,0 +1,15 @@
+**/logs/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pkl
+*.pth
+*.ckpt
+*.log
+results/
+tune_metadata/
+*csv
+*.json
+ray_results/
+eval_results/
+

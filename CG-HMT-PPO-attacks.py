@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# ppo_v7_fixed.py
+# CG-HMT  (with --attack support)
 from __future__ import absolute_import, division, print_function
 
 import argparse
@@ -7,10 +7,13 @@ import datetime
 import math
 import os
 import sys
+import random
 
 import cv2
 import gym
 import macad_gym  # registers MACAD envs
+import numpy as np
+import tkinter as tk
 
 try:
     import scenarios.custom_stop_sign_5c_town03   # noqa
@@ -18,9 +21,6 @@ try:
 except ImportError:
     _HAS_CUSTOM_5C = False
     custom_stop_sign_5c_town03 = None
-
-import numpy as np
-import tkinter as tk
 
 import ray
 from gym.spaces import Box, Discrete
@@ -84,6 +84,16 @@ parser.add_argument("--notes", default=None)
 
 parser.add_argument("--metrics-csv", type=str, default="cghmt_metrics.csv",
                     help="Path to CSV file where per-episode metrics will be logged.")
+
+parser.add_argument(
+    "--attack",
+    type=str,
+    default="none",
+    choices=["none", "v2x", "weather", "byzantine"],
+    help="Apply a simple, severe test-time attack: "
+         "'none' (default), 'v2x' (comm blackouts via stale observations), "
+         "'weather' (heavy blur + darken), 'byzantine' (flip one agent's actions)."
+)
 
 # Use your MASS3 env for stability; MASS5 works if spawn config is correct.
 PREFERRED_ENV_NAME = "HomoNcomIndePOIntrxMASS3CTWN3-v0"
@@ -195,18 +205,7 @@ class SpawnSpacingWrapper(MultiAgentEnv):
 class HumanTrustInterface:
     """
     Tk-based dashboard for human trust input, in a separate window.
-
-    - Shows one row per agent with:
-        * Agent ID
-        * Auto trust
-        * Human trust
-        * Combined trust
-        * Uncertainty
-        * Last reward
-        * Divergence indicator color
-        * Buttons for human feedback
     """
-
     _instance = None
 
     @classmethod
@@ -472,11 +471,7 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
       - Human trust via Tk-based UI nudges.
       - Combined trust per agent (auto+human).
       - Global human trust.
-      - Reward shaping dominated by:
-        * step-wise progress toward goal,
-        * collisions,
-        * infractions per distance.
-      - Per-episode metric logging to CSV.
+      - Reward shaping + per-episode metrics CSV.
     """
 
     def __init__(self,
@@ -510,14 +505,12 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
         self.lambda_C = lambda_C
         self.lambda_unc = lambda_unc
 
-        # These are now much more meaningful for driving behaviour
         self.trust_reward_weight = trust_reward_weight
         self.consistency_weight = consistency_weight
 
-        # Main shaping scales
-        self.prog_bonus = prog_bonus      # reward per unit of normalized progress
-        self.coll_penalty = coll_penalty  # penalty per collision increment
-        self.infr_penalty = infr_penalty  # penalty per infraction increment
+        self.prog_bonus = prog_bonus
+        self.coll_penalty = coll_penalty
+        self.infr_penalty = infr_penalty
 
         self.fixed_delta_seconds = fixed_delta_seconds
 
@@ -530,13 +523,11 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
         self.episode_index = -1
         self._reset_episode_counters()
 
-        # NEW: cumulative stats across all episodes (for CSV)
         self.cumulative_shaped_sum = 0.0
         self.cumulative_episode_count = 0
 
     # ---------- metrics CSV ----------
     def _init_metrics_csv(self):
-        # If file does not exist, write header with cumulative column
         if not os.path.exists(self.metrics_csv_path):
             with open(self.metrics_csv_path, "w") as f:
                 f.write(
@@ -595,7 +586,6 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
         else:
             avg_shaped_reward = 0.0
 
-        # NEW: update and compute cumulative average shaped reward
         self.cumulative_shaped_sum += avg_shaped_reward
         self.cumulative_episode_count += 1
         cumulative_avg_shaped_reward = (
@@ -746,7 +736,6 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
         if d_goal is not None:
             if st["init_distance"] is None and d_goal > 0.0:
                 st["init_distance"] = d_goal
-            # store previous distance before updating
             st["prev_distance_last"] = st["distance_last"]
             st["distance_last"] = d_goal
 
@@ -841,7 +830,6 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
             mu_gap = float(np.linalg.norm(st["mu"] - mu_bar))
             divergent = (mu_gap > 5.0) or (st["U"] > 0.6)
 
-            # count prompts: a prompt is a new divergent event
             if divergent and not st["divergent_prev"]:
                 self.episode_prompts += 1
             st["divergent_prev"] = divergent
@@ -892,7 +880,6 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
             if init_d is not None and last_d is not None and prev_d is not None:
                 raw_step_prog = prev_d - last_d  # >0 if moved closer
                 raw_step_prog = max(raw_step_prog, 0.0)
-                # normalize by initial distance so total possible sum ≈ 1.0
                 delta_prog = raw_step_prog / max(init_d, 1e-6)
             else:
                 delta_prog = 0.0
@@ -901,7 +888,6 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
             delta_coll = float(st.get("delta_collisions", 0.0))
             delta_inf = float(st.get("delta_infractions", 0.0))
 
-            # main shaped reward (trust terms kept out for clarity)
             shaped = (
                 base_r +
                 self.prog_bonus * delta_prog -
@@ -929,6 +915,94 @@ class IMMTrustHumanWrapper(MultiAgentEnv):
         return obs, new_rewards, done_dict, info_dict
 
 # ============================================================
+# 7.5) Attack wrapper (easy-to-integrate severe stressors)
+# ============================================================
+class AttackWrapper(MultiAgentEnv):
+    """
+    Applies simple test-time attacks:
+      - 'v2x'      : observation staleness (per-agent blackout with prob p).
+      - 'weather'  : heavy blur + brightness drop on camera observations.
+      - 'byzantine': flip one agent's actions frequently.
+      - 'none'     : pass-through.
+    """
+    def __init__(self, env, mode="none"):
+        self.env = env
+        self.mode = mode
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+
+        # Buffers for attacks
+        self.prev_obs = {}
+        self.agent_ids_last = []
+        self.byz_agents = set()
+        # Fixed severe settings
+        self.v2x_drop_prob = 0.4         # 40% of the time, use stale frame
+        self.byz_flip_prob = 0.5         # 50% steps flip action
+        self.rand = random.Random(1337)
+
+    def reset(self, *, seed=None, options=None):
+        obs = self.env.reset(seed=seed, options=options)
+        # Store initial prev_obs for v2x
+        self.prev_obs = {aid: np.copy(o) for aid, o in obs.items() if aid != "__all__"}
+        self.agent_ids_last = [aid for aid in obs.keys() if aid != "__all__"]
+        self.byz_agents = set()
+        return self._maybe_weather(obs)
+
+    def step(self, action_dict):
+        # Byzantine: pick one agent, flip its actions often
+        if self.mode == "byzantine":
+            if not self.byz_agents:
+                # deterministically pick first seen agent id for reproducibility
+                if self.agent_ids_last:
+                    self.byz_agents = {sorted(self.agent_ids_last)[0]}
+            # Apply flips
+            for aid in list(action_dict.keys()):
+                if aid in self.byz_agents and self.rand.random() < self.byz_flip_prob:
+                    a = action_dict.get(aid, None)
+                    if isinstance(a, int):
+                        # pick a different action uniformly
+                        new_a = a
+                        while new_a == a:
+                            new_a = self.rand.randrange(0, 9)
+                        action_dict[aid] = new_a
+
+        obs, rewards, dones, infos = self.env.step(action_dict)
+        self.agent_ids_last = [aid for aid in obs.keys() if aid != "__all__"]
+
+        # V2X: with probability p, replace current obs with previous obs (per agent)
+        if self.mode == "v2x":
+            for aid in self.agent_ids_last:
+                if aid in self.prev_obs and self.rand.random() < self.v2x_drop_prob:
+                    obs[aid] = np.copy(self.prev_obs[aid])
+                else:
+                    self.prev_obs[aid] = np.copy(obs[aid])
+
+        # Weather: blur + darken every frame
+        obs = self._maybe_weather(obs)
+
+        return obs, rewards, dones, infos
+
+    def _maybe_weather(self, obs_dict):
+        if self.mode != "weather":
+            return obs_dict
+        out = {}
+        for k, v in obs_dict.items():
+            if k == "__all__":
+                out[k] = v
+                continue
+            img = v
+            # Expect HxWxC uint8; if not, try to convert safely
+            if isinstance(img, np.ndarray) and img.ndim == 3 and img.dtype == np.uint8:
+                # heavy blur
+                blurred = cv2.GaussianBlur(img, (7, 7), 3)
+                # darken and reduce contrast
+                dark = cv2.convertScaleAbs(blurred, alpha=0.7, beta=-30)
+                out[k] = dark
+            else:
+                out[k] = v
+        return out
+
+# ============================================================
 # 8) Env factory for Ray workers
 # ============================================================
 def make_env_with_wrappers(resolved_env_name, env_config):
@@ -946,12 +1020,15 @@ def make_env_with_wrappers(resolved_env_name, env_config):
         num_actions=9,
         trust_reward_weight=env_config.get("team_reward_weight", 0.1),
         consistency_weight=0.01,
-        # new meaningful scales (can tune later)
         prog_bonus=2.0,
         coll_penalty=2.0,
         infr_penalty=1.0,
         fixed_delta_seconds=0.05,
     )
+
+    # Attack wrapper last, so it sees policy actions and tampers or corrupts observations
+    attack_mode = env_config.get("attack", "none")
+    env = AttackWrapper(env, mode=attack_mode)
     return env
 
 # ============================================================
@@ -983,6 +1060,7 @@ if __name__ == "__main__":
                 "desired_gap": args.desired_gap,
                 "env": env_actor_configs["env"],
                 "metrics_csv_path": args.metrics_csv,
+                "attack": args.attack,  # <--- pass attack setting into env
             },
         ),
     )
@@ -1040,10 +1118,10 @@ if __name__ == "__main__":
                 "policy_mapping_fn": policy_mapping_fn,
             },
         },
-        checkpoint_freq=10,            # save every 10 iters
-        checkpoint_at_end=True,        # save final checkpoint
-        keep_checkpoints_num=1,        # only keep the best
-        checkpoint_score_attr="episode_reward_mean",  # "best" based on this
+        checkpoint_freq=10,
+        checkpoint_at_end=True,
+        keep_checkpoints_num=1,
+        checkpoint_score_attr="episode_reward_mean",
     )
 
     # Ray 0.8.6 compatible way to get the best checkpoint
