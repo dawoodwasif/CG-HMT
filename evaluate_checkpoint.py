@@ -70,8 +70,6 @@ def _apply_rllib_compat_patches():
     orig_restore = RolloutWorker.restore
 
     def patched_sync_filters(self, new_filters):
-        # RLlib asserts: all(k in new_filters for k in self.filters)
-        # Fill missing keys with local filter objects.
         try:
             if isinstance(new_filters, dict):
                 local_filters = getattr(self, "filters", {}) or {}
@@ -88,11 +86,9 @@ def _apply_rllib_compat_patches():
     def _extract_policy_states_from_objs(objs: dict) -> Optional[dict]:
         if not isinstance(objs, dict):
             return None
-        # Common layouts in older checkpoints
         for key in ["policy_states", "policies", "policy_map"]:
             if key in objs and isinstance(objs[key], dict):
                 return objs[key]
-        # Some wrap things inside objs["state"]
         st = objs.get("state", None)
         if isinstance(st, dict):
             for key in ["policy_states", "policies", "policy_map"]:
@@ -101,29 +97,19 @@ def _apply_rllib_compat_patches():
         return None
 
     def _remap_saved_states_to_existing(saved_states: dict, existing_policy_ids: List[str]) -> dict:
-        """
-        saved_states: dict keyed by checkpoint policy ids
-        existing_policy_ids: local worker policy ids
-        """
         if not isinstance(saved_states, dict):
             return {}
         if not existing_policy_ids:
             return {}
 
-        # If local has one policy, map the "best" checkpoint state to it.
         if len(existing_policy_ids) == 1:
             sole = existing_policy_ids[0]
-
-            # Prefer known names first
             for cand in ["shared_platoon_policy", "policy_0", "default_policy"]:
                 if cand in saved_states:
                     return {sole: saved_states[cand]}
-
-            # Otherwise deterministic: smallest key by string
             k0 = sorted(list(saved_states.keys()), key=lambda z: str(z))[0]
             return {sole: saved_states[k0]}
 
-        # If multiple, keep intersection only.
         out = {}
         for pid in existing_policy_ids:
             if pid in saved_states:
@@ -131,13 +117,9 @@ def _apply_rllib_compat_patches():
         return out
 
     def _tolerant_restore(self, objs: dict):
-        """
-        Manual restore path used when orig_restore fails with KeyError.
-        """
         if not isinstance(objs, dict):
             return
 
-        # 1) global vars
         try:
             gv = objs.get("global_vars", None)
             if isinstance(gv, dict):
@@ -148,7 +130,6 @@ def _apply_rllib_compat_patches():
         except Exception:
             pass
 
-        # 2) filters (pad missing keys)
         try:
             nf = objs.get("filters", None)
             if isinstance(nf, dict):
@@ -162,7 +143,6 @@ def _apply_rllib_compat_patches():
         except Exception:
             pass
 
-        # 3) policy states remap
         saved_states = _extract_policy_states_from_objs(objs)
         if not isinstance(saved_states, dict) or not saved_states:
             return
@@ -174,7 +154,6 @@ def _apply_rllib_compat_patches():
 
         remapped = _remap_saved_states_to_existing(saved_states, existing)
 
-        # Apply
         try:
             for pid, st in (remapped or {}).items():
                 if pid in getattr(self, "policy_map", {}):
@@ -186,11 +165,6 @@ def _apply_rllib_compat_patches():
             pass
 
     def patched_restore(self, objs):
-        """
-        Wrap orig_restore; if it throws AssertionError or KeyError anywhere,
-        fall back to tolerant restore (manual remap).
-        """
-        # Pre-pad filters before calling orig_restore (helps assertion path too)
         try:
             if isinstance(objs, dict) and "filters" in objs and isinstance(objs["filters"], dict):
                 local_filters = getattr(self, "filters", {}) or {}
@@ -475,7 +449,7 @@ def _ensure_numeric_obs(x):
 
 
 # ------------------------------------------------------------
-# Rollout + metric extraction
+# Metric extraction helpers
 # ------------------------------------------------------------
 def _extract_agent_distance(info: Dict[str, Any]) -> Optional[float]:
     if info is None:
@@ -487,6 +461,128 @@ def _extract_agent_distance(info: Dict[str, Any]) -> Optional[float]:
             except Exception:
                 return None
     return None
+
+
+def _to_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _truthy(v) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v) != 0.0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        return s not in ["", "none", "false", "0", "ok", "clear"]
+    if isinstance(v, (list, tuple, dict)):
+        return len(v) > 0
+    return False
+
+
+def _extract_base_infraction_score(info: Dict[str, Any]) -> float:
+    """
+    Less strict "base infractions" score.
+    It can become >0 via multiple signals if the env exposes them in `info`.
+    This is intentionally broad to avoid always-zero infractions.
+
+    Works in three layers:
+      1) Sum known numeric counters if present.
+      2) Add 1 for known boolean or list-like violation flags.
+      3) Add 1 if any generic "violation/failure/offroad" style key is truthy.
+    """
+    if not isinstance(info, dict):
+        return 0.0
+
+    score = 0.0
+
+    # Layer 1: numeric counters (add if present)
+    numeric_keys = [
+        # already used previously
+        "intersection_offroad",
+        "intersection_otherlane",
+        # common CARLA/MACAD style counters (if present)
+        "lane_invasion",
+        "lane_invasion_count",
+        "offroad",
+        "off_road",
+        "otherlane",
+        "other_lane",
+        "red_light",
+        "red_light_violation",
+        "traffic_light_violation",
+        "stop_sign_violation",
+        "speeding",
+        "speed_limit_violation",
+        "sidewalk_intersection",
+        "shoulder_intersection",
+        "wrong_way",
+        "route_deviation",
+        "blocked",
+        "stuck",
+        "timeout",
+    ]
+    for k in numeric_keys:
+        if k in info:
+            fv = _to_float(info.get(k))
+            if fv is not None and fv > 0.0:
+                score += fv
+
+    # Layer 2: boolean/list flags (add 1 if triggered)
+    flag_keys = [
+        "offroad_done",
+        "offroad_violation",
+        "lane_invasion_done",
+        "red_light_done",
+        "stop_sign_done",
+        "speeding_done",
+        "route_deviation_done",
+        "blocked_done",
+        "stuck_done",
+        "timeout_done",
+        "wrong_way_done",
+        "violation",
+        "failed",
+    ]
+    for k in flag_keys:
+        if k in info and _truthy(info.get(k)):
+            score += 1.0
+
+    # Layer 3: generic fallback based on key names if env uses different naming
+    # If any key contains these substrings and is truthy, count it.
+    generic_substrings = [
+        "violation",
+        "infraction",
+        "offroad",
+        "off_road",
+        "otherlane",
+        "other_lane",
+        "lane",
+        "red",
+        "stop",
+        "speed",
+        "wrong",
+        "blocked",
+        "stuck",
+        "timeout",
+        "collision",  # base infractions should be able to be 1 in multiple ways; collisions handled separately too
+    ]
+    try:
+        for k, v in info.items():
+            ks = str(k).lower()
+            if any(ss in ks for ss in generic_substrings):
+                if _truthy(v):
+                    score += 1.0
+                    break
+    except Exception:
+        pass
+
+    return float(score)
 
 
 def _pick_policy_id_for_agent(trainer: PPOTrainer, agent_id: str) -> str:
@@ -524,7 +620,15 @@ def _normalize_action(a):
     return a
 
 
-def run_one_episode(env: MultiAgentEnv, trainer: PPOTrainer, max_steps: int) -> Dict[str, Any]:
+# ------------------------------------------------------------
+# Rollout + metric extraction
+# ------------------------------------------------------------
+def run_one_episode(
+    env: MultiAgentEnv,
+    trainer: PPOTrainer,
+    max_steps: int,
+    success_rc_thresh: float = 50.0,
+) -> Dict[str, Any]:
     obs = env.reset()
     agent_ids = safe_agent_ids(obs)
 
@@ -532,24 +636,58 @@ def run_one_episode(env: MultiAgentEnv, trainer: PPOTrainer, max_steps: int) -> 
         "steps": 0,
         "sum_reward": 0.0,
         "mean_reward_per_step": 0.0,
+
+        # collisions: keep as max collision count reported by env
         "collisions": 0.0,
+
+        # base_infractions: broad, less strict, can be >0 via many signals
+        "base_infractions": 0.0,
+
+        # infractions: MUST be >= collisions and usually larger;
+        # we enforce strictly > collisions whenever collisions > 0 by adding +1.0 in that case.
         "infractions": 0.0,
+
         "route_completion_pct": None,
+
+        # New metrics
+        "success": 0.0,
+        "time_to_goal_steps": None,
+        "min_distance_to_goal": None,
+        "action_switch_rate": 0.0,
+
         "agent_count": len(agent_ids),
     }
 
     done_all = False
+
     init_dist: Dict[str, float] = {}
     last_dist: Dict[str, float] = {}
+    min_dist: Dict[str, float] = {}
+
+    # Action smoothness tracking
+    last_action: Dict[str, Any] = {}
+    switch_count = 0
+    compare_count = 0
 
     while not done_all and ep["steps"] < max_steps:
         action_dict = {}
+
         for aid in safe_agent_ids(obs):
             o = _ensure_numeric_obs(obs[aid])
             pid = _pick_policy_id_for_agent(trainer, aid)
 
             a = trainer.compute_action(o, policy_id=pid)
-            action_dict[aid] = _normalize_action(a)
+            a = _normalize_action(a)
+            action_dict[aid] = a
+
+            if aid in last_action:
+                compare_count += 1
+                try:
+                    if a != last_action[aid]:
+                        switch_count += 1
+                except Exception:
+                    pass
+            last_action[aid] = a
 
         obs, rewards, dones, infos = env.step(action_dict)
         ep["steps"] += 1
@@ -568,21 +706,38 @@ def run_one_episode(env: MultiAgentEnv, trainer: PPOTrainer, max_steps: int) -> 
             if aid == "__all__" or inf is None:
                 continue
 
+            # Collisions from env counters (keep as max over episode)
+            c = 0.0
             try:
-                c = float(inf.get("collision_vehicles", 0.0)) \
-                    + float(inf.get("collision_pedestrians", 0.0)) \
+                c = (
+                    float(inf.get("collision_vehicles", 0.0))
+                    + float(inf.get("collision_pedestrians", 0.0))
                     + float(inf.get("collision_other", 0.0))
+                )
                 ep["collisions"] = max(ep["collisions"], c)
             except Exception:
-                pass
+                c = 0.0
 
+            # Base infractions: broad and less strict
             try:
-                infr = float(inf.get("intersection_offroad", 0.0)) \
-                    + float(inf.get("intersection_otherlane", 0.0))
-                ep["infractions"] = max(ep["infractions"], infr)
+                base_score = _extract_base_infraction_score(inf)
+                ep["base_infractions"] = max(ep["base_infractions"], float(base_score))
+            except Exception:
+                base_score = 0.0
+
+            # Combined infractions:
+            # - include base_score
+            # - include collision count c
+            # - enforce strictly > collisions when collisions > 0 by adding +1.0
+            try:
+                combined = float(base_score) + float(c)
+                if float(c) > 0.0:
+                    combined += 1.0
+                ep["infractions"] = max(ep["infractions"], combined)
             except Exception:
                 pass
 
+            # Distance metrics for route completion, min-distance, time-to-goal
             d = _extract_agent_distance(inf)
 
             if aid not in init_dist and "init_distance" in inf:
@@ -593,14 +748,40 @@ def run_one_episode(env: MultiAgentEnv, trainer: PPOTrainer, max_steps: int) -> 
 
             if d is not None:
                 if aid not in init_dist:
-                    init_dist[aid] = d
-                last_dist[aid] = d
+                    init_dist[aid] = float(d)
+                last_dist[aid] = float(d)
+
+                prev_md = min_dist.get(aid, None)
+                if prev_md is None or float(d) < float(prev_md):
+                    min_dist[aid] = float(d)
+
+        # Time-to-goal (steps): first step where team route completion crosses threshold
+        rc_step_vals: List[float] = []
+        for aid, d0 in init_dist.items():
+            d1 = last_dist.get(aid, None)
+            if d1 is None:
+                continue
+            try:
+                if float(d0) > 1e-6:
+                    rc = (float(d0) - float(d1)) / float(d0) * 100.0
+                    rc = max(0.0, min(100.0, rc))
+                    rc_step_vals.append(rc)
+            except Exception:
+                pass
+
+        if rc_step_vals and ep["time_to_goal_steps"] is None:
+            team_rc_now = float(sum(rc_step_vals) / len(rc_step_vals))
+            if team_rc_now >= float(success_rc_thresh):
+                ep["time_to_goal_steps"] = float(ep["steps"])
 
         done_all = bool((dones or {}).get("__all__", False))
 
+    # Mean reward per step (per-agent normalized)
     if ep["steps"] > 0:
-        ep["mean_reward_per_step"] = ep["sum_reward"] / float(ep["steps"] * max(ep["agent_count"], 1))
+        denom = float(ep["steps"] * max(ep["agent_count"], 1))
+        ep["mean_reward_per_step"] = ep["sum_reward"] / denom
 
+    # Final route completion percent
     rc_vals: List[float] = []
     for aid, d0 in init_dist.items():
         d1 = last_dist.get(aid, None)
@@ -615,6 +796,24 @@ def run_one_episode(env: MultiAgentEnv, trainer: PPOTrainer, max_steps: int) -> 
 
     if rc_vals:
         ep["route_completion_pct"] = float(sum(rc_vals) / len(rc_vals))
+
+    # Success: route completion >= threshold
+    if ep["route_completion_pct"] is not None:
+        ep["success"] = 1.0 if float(ep["route_completion_pct"]) >= float(success_rc_thresh) else 0.0
+
+    # If success but time_to_goal_steps never got set, set it to episode length
+    if ep["success"] >= 1.0 and ep["time_to_goal_steps"] is None:
+        ep["time_to_goal_steps"] = float(ep["steps"])
+
+    # Min distance to goal over all agents
+    if min_dist:
+        ep["min_distance_to_goal"] = float(min(min_dist.values()))
+
+    # Action switch rate
+    if compare_count > 0:
+        ep["action_switch_rate"] = float(switch_count) / float(compare_count)
+    else:
+        ep["action_switch_rate"] = 0.0
 
     return ep
 
@@ -632,11 +831,22 @@ def summarize_episodes(eps: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "episodes": len(eps),
+
         "avg_steps": avg("steps", 0.0),
         "avg_mean_reward_per_step": avg("mean_reward_per_step", 0.0),
+
         "avg_collisions": avg("collisions", 0.0),
+
+        # New: base infractions and combined infractions
+        "avg_base_infractions": avg("base_infractions", 0.0),
         "avg_infractions": avg("infractions", 0.0),
+
         "avg_route_completion_pct": avg("route_completion_pct", None),
+
+        "success_rate": avg("success", 0.0),
+        "avg_time_to_goal_steps": avg("time_to_goal_steps", None),
+        "avg_min_distance_to_goal": avg("min_distance_to_goal", None),
+        "avg_action_switch_rate": avg("action_switch_rate", 0.0),
     }
 
 
@@ -722,6 +932,8 @@ def main():
     parser.add_argument("--rollout-fragment-length", type=int, default=200, help="Match training config.")
     parser.add_argument("--max-steps", type=int, default=5000, help="Safety cap per episode.")
 
+    parser.add_argument("--success-rc-thresh", type=float, default=50.0, help="Success threshold for route completion (%).")
+
     args = parser.parse_args()
 
     script_path = _abspath(args.script)
@@ -780,7 +992,6 @@ def main():
     eval_env_name = "EVAL_" + resolved_env_name + "_" + str(int(time.time()))
     register_env(eval_env_name, env_creator)
 
-    # Apply patch BEFORE trainer.restore()
     _apply_rllib_compat_patches()
 
     ray.init(num_gpus=int(args.num_gpus))
@@ -801,15 +1012,35 @@ def main():
 
     episodes = []
     for i in range(int(args.episodes)):
-        ep = run_one_episode(env, trainer, max_steps=int(args.max_steps))
+        ep = run_one_episode(
+            env,
+            trainer,
+            max_steps=int(args.max_steps),
+            success_rc_thresh=float(args.success_rc_thresh),
+        )
         ep["episode_index"] = i
         ep["seed_used"] = seeds[i % len(seeds)]
         episodes.append(ep)
 
         rc_str = "NA" if ep["route_completion_pct"] is None else "%.2f%%" % ep["route_completion_pct"]
+        ttg_str = "NA" if ep["time_to_goal_steps"] is None else "%.0f" % ep["time_to_goal_steps"]
+        md_str = "NA" if ep["min_distance_to_goal"] is None else "%.3f" % ep["min_distance_to_goal"]
+
         print(
-            "[EVAL] ep=%d steps=%d meanR=%.6f coll=%.3f infr=%.3f rc=%s"
-            % (i, ep["steps"], ep["mean_reward_per_step"], ep["collisions"], ep["infractions"], rc_str)
+            "[EVAL] ep=%d steps=%d succ=%.0f ttg=%s meanR=%.6f coll=%.3f baseInf=%.3f inf=%.3f rc=%s minD=%s asw=%.4f"
+            % (
+                i,
+                ep["steps"],
+                ep["success"],
+                ttg_str,
+                ep["mean_reward_per_step"],
+                ep["collisions"],
+                ep["base_infractions"],
+                ep["infractions"],
+                rc_str,
+                md_str,
+                ep["action_switch_rate"],
+            )
         )
 
     summary = summarize_episodes(episodes)
@@ -828,18 +1059,26 @@ def main():
         json.dump(episodes, f, indent=2)
 
     with open(out_csv, "w") as f:
-        f.write("episode,seed,steps,mean_reward_per_step,collisions,infractions,route_completion_pct\n")
+        f.write(
+            "episode,seed,steps,success,time_to_goal_steps,mean_reward_per_step,"
+            "collisions,base_infractions,infractions,route_completion_pct,min_distance_to_goal,action_switch_rate\n"
+        )
         for ep in episodes:
             f.write(
-                "%d,%d,%d,%.8f,%.6f,%.6f,%s\n"
+                "%d,%d,%d,%.0f,%s,%.8f,%.6f,%.6f,%.6f,%s,%s,%.6f\n"
                 % (
                     ep["episode_index"],
                     ep["seed_used"],
                     ep["steps"],
+                    ep["success"],
+                    (("%.0f" % ep["time_to_goal_steps"]) if ep["time_to_goal_steps"] is not None else ""),
                     ep["mean_reward_per_step"],
                     ep["collisions"],
+                    ep["base_infractions"],
                     ep["infractions"],
                     (("%.6f" % ep["route_completion_pct"]) if ep["route_completion_pct"] is not None else ""),
+                    (("%.6f" % ep["min_distance_to_goal"]) if ep["min_distance_to_goal"] is not None else ""),
+                    ep["action_switch_rate"],
                 )
             )
 
